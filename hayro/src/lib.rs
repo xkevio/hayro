@@ -47,7 +47,7 @@ pub use hayro_interpret::{InterpreterSettings, Pdf};
 use kurbo::{Affine, Rect, Shape};
 use std::ops::RangeInclusive;
 pub use vello_cpu::Pixmap;
-use vello_cpu::color::palette::css::WHITE;
+use vello_cpu::color::palette::css::TRANSPARENT;
 use vello_cpu::{Level, RenderMode};
 
 mod renderer;
@@ -111,7 +111,7 @@ pub fn render(
 
     let mut device = Renderer::new(pix_width, pix_height, vc_settings);
 
-    device.ctx.set_paint(WHITE);
+    device.ctx.set_paint(TRANSPARENT);
     device
         .ctx
         .fill_rect(&Rect::new(0.0, 0.0, pix_width as f64, pix_height as f64));
