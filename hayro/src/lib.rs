@@ -50,6 +50,7 @@ pub use vello_cpu::Pixmap;
 use vello_cpu::color::AlphaColor;
 use vello_cpu::color::Srgb;
 use vello_cpu::color::palette::css::TRANSPARENT;
+use vello_cpu::color::palette::css::WHITE;
 use vello_cpu::{Level, RenderMode};
 
 mod renderer;
@@ -67,7 +68,7 @@ pub struct RenderSettings {
     /// The height of the viewport. If this is set to `None`, the height will be chosen
     /// automatically based on the scale factor and the dimensions of the PDF.
     pub height: Option<u16>,
-    /// The background rasterization color. Determines the color of the base
+    /// The background color. Determines the color of the base
     /// rectangle during rendering to a pixmap.
     pub bg_color: AlphaColor<Srgb>,
 }
@@ -161,6 +162,7 @@ pub fn render_pdf(
                 &RenderSettings {
                     x_scale: scale,
                     y_scale: scale,
+                    bg_color: WHITE,
                     ..Default::default()
                 },
             );
