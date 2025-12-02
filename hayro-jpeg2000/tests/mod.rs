@@ -1,9 +1,10 @@
 use hayro_jpeg2000::bitmap::Bitmap;
-use hayro_jpeg2000::read;
+use hayro_jpeg2000::{ColourSpecificationMethod, DecodeSettings, EnumeratedColourspace, read};
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
 use indicatif::{ProgressBar, ProgressStyle};
 use moxcms::{ColorProfile, Layout, TransformOptions};
 use rayon::prelude::*;
+use serde::Deserialize;
 use std::any::Any;
 use std::cmp::max;
 use std::fs;
@@ -12,13 +13,21 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+const ROMM_PROFILE: &[u8] = include_bytes!("../assets/ISO22028-2_ROMM-RGB.icc");
+const CMYK_PROFILE: &[u8] = include_bytes!("../assets/CGATS001Compat-v2-micro.icc");
+
 const REPLACE: Option<&str> = option_env!("REPLACE");
 
 static WORKSPACE_PATH: LazyLock<PathBuf> =
     LazyLock::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(""));
 
-static ASSETS_PATH: LazyLock<PathBuf> = LazyLock::new(|| WORKSPACE_PATH.join("assets"));
 static SNAPSHOTS_PATH: LazyLock<PathBuf> = LazyLock::new(|| WORKSPACE_PATH.join("snapshots"));
+static TEST_INPUTS_PATH: LazyLock<PathBuf> = LazyLock::new(|| WORKSPACE_PATH.join("test-inputs"));
+
+const INPUT_MANIFESTS: &[(&str, &str)] = &[
+    ("serenity", "manifest_serenity.json"),
+    ("openjpeg", "manifest_openjpeg.json"),
+];
 
 static DIFFS_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     let path = WORKSPACE_PATH.join("diffs");
@@ -50,7 +59,7 @@ fn run_harness() -> bool {
     };
 
     if asset_files.is_empty() {
-        eprintln!("No .jp2 assets were found in {}", ASSETS_PATH.display());
+        eprintln!("No test inputs were found. Run `python sync.py` to download them.");
         return false;
     }
 
@@ -66,7 +75,7 @@ fn run_harness() -> bool {
     let reports: Vec<TestReport> = asset_files
         .par_iter()
         .map(|asset| {
-            let name = asset.file_name().unwrap().to_string_lossy().to_string();
+            let name = asset.display_name.clone();
             progress_bar.set_message(name.clone());
             let start = Instant::now();
             let outcome = catch_unwind(AssertUnwindSafe(|| run_asset_test(asset))).unwrap_or_else(
@@ -150,95 +159,216 @@ impl Drop for PanicHookGuard {
     }
 }
 
-fn collect_asset_files() -> Result<Vec<PathBuf>, String> {
-    let mut files = vec![];
-    let dir = fs::read_dir(&*ASSETS_PATH).map_err(|err| {
-        format!(
-            "failed to read assets directory {}: {err}",
-            ASSETS_PATH.display()
-        )
-    })?;
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ManifestItem {
+    Simple(String),
+    Detailed {
+        id: String,
+        #[serde(default = "default_render")]
+        render: bool,
+    },
+}
 
-    for entry in dir {
-        let entry = entry.map_err(|err| format!("failed to read asset entry: {err}"))?;
-        let path = entry.path();
-        if path.is_file()
-            && path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("jp2") || ext.eq_ignore_ascii_case("jpf"))
-                .unwrap_or(false)
-        {
-            files.push(path);
+struct AssetEntry {
+    relative_path: PathBuf,
+    display_name: String,
+    render: bool,
+}
+
+impl AssetEntry {
+    fn new(namespace: &str, id: String, render: bool) -> Self {
+        let relative_path = Path::new(namespace).join(&id);
+        let display_name = relative_path.display().to_string();
+        Self {
+            relative_path,
+            display_name,
+            render,
+        }
+    }
+}
+
+impl ManifestItem {
+    fn into_asset(self, namespace: &str) -> AssetEntry {
+        match self {
+            ManifestItem::Simple(id) => AssetEntry::new(namespace, id, true),
+            ManifestItem::Detailed { id, render } => AssetEntry::new(namespace, id, render),
+        }
+    }
+}
+
+fn default_render() -> bool {
+    true
+}
+
+fn collect_asset_files() -> Result<Vec<AssetEntry>, String> {
+    let mut files = vec![];
+
+    for (namespace, manifest_rel_path) in INPUT_MANIFESTS {
+        let manifest_path = WORKSPACE_PATH.join(manifest_rel_path);
+        let content = fs::read_to_string(&manifest_path)
+            .map_err(|err| format!("failed to read manifest {}: {err}", manifest_path.display()))?;
+        let entries: Vec<ManifestItem> = serde_json::from_str(&content).map_err(|err| {
+            format!(
+                "failed to parse manifest {}: {err}",
+                manifest_path.display()
+            )
+        })?;
+
+        for entry in entries {
+            let asset_entry = entry.into_asset(namespace);
+            let absolute_path = TEST_INPUTS_PATH.join(&asset_entry.relative_path);
+            if !absolute_path.exists() {
+                return Err(format!(
+                    "missing test input {} (expected at {})",
+                    asset_entry.display_name,
+                    absolute_path.display()
+                ));
+            }
+            files.push(asset_entry);
         }
     }
 
-    files.sort();
+    files.sort_by(|a, b| a.display_name.cmp(&b.display_name));
     Ok(files)
 }
 
-fn run_asset_test(asset_path: &Path) -> Result<(), String> {
-    let file_name = asset_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("asset path is not valid UTF-8: {}", asset_path.display()))?
-        .to_string();
+fn run_asset_test(asset: &AssetEntry) -> Result<(), String> {
+    let asset_path = TEST_INPUTS_PATH.join(&asset.relative_path);
+    let asset_name = &asset.display_name;
 
     let data =
-        fs::read(asset_path).map_err(|err| format!("failed to read {}: {err}", file_name))?;
-    let bitmap = read(&data).map_err(|err| format!("failed to decode {}: {err:?}", file_name))?;
+        fs::read(&asset_path).map_err(|err| format!("failed to read {}: {err}", asset_name))?;
+    let bitmap_result = read(&data, &DecodeSettings::default());
 
-    let rgba = bitmap_to_dynamic_image(bitmap).into_rgba8();
-    let reference_name = Path::new(&file_name)
-        .with_extension("png")
-        .file_name()
-        .unwrap()
-        .to_owned();
+    if !asset.render {
+        // Crash-only test: just execute the decoder to ensure it handles the file.
+        let _ = bitmap_result;
+        return Ok(());
+    }
 
-    let snapshot_path = SNAPSHOTS_PATH.join(&reference_name);
+    let bitmap =
+        bitmap_result.map_err(|err| format!("failed to decode {}: {err:?}", asset_name))?;
 
-    fs::create_dir_all(&*SNAPSHOTS_PATH)
-        .map_err(|err| format!("failed to create snapshots directory: {err}"))?;
+    let rgba = bitmap_to_dynamic_image(bitmap)
+        .map_err(|err| format!("failed to rasterize {}: {err}", asset_name))?
+        .into_rgba8();
+    let reference_path = asset.relative_path.with_extension("png");
+    let snapshot_path = SNAPSHOTS_PATH.join(&reference_path);
+
+    if let Some(parent) = snapshot_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create snapshot directory: {err}"))?;
+    }
 
     if !snapshot_path.exists() {
         rgba.save_with_format(&snapshot_path, ImageFormat::Png)
-            .map_err(|err| format!("failed to save snapshot for {}: {err}", file_name))?;
-        return Err(format!("new reference image was created for {}", file_name));
+            .map_err(|err| format!("failed to save snapshot for {}: {err}", asset_name))?;
+        return Err(format!(
+            "new reference image was created for {}",
+            asset_name
+        ));
     }
 
     let expected = image::open(&snapshot_path)
-        .map_err(|err| format!("failed to load snapshot for {}: {err}", file_name))?
+        .map_err(|err| format!("failed to load snapshot for {}: {err}", asset_name))?
         .into_rgba8();
     let (diff_image, pixel_diff) = get_diff(&expected, &rgba);
 
     if pixel_diff > 0 {
-        let diff_path = DIFFS_PATH.join(&reference_name);
+        let diff_path = DIFFS_PATH.join(&reference_path);
+
+        if let Some(parent) = diff_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create diff directory: {err}"))?;
+        }
 
         diff_image
             .save_with_format(&diff_path, ImageFormat::Png)
-            .map_err(|err| format!("failed to save diff for {}: {err}", file_name))?;
+            .map_err(|err| format!("failed to save diff for {}: {err}", asset_name))?;
 
         if REPLACE.is_some() {
             rgba.save_with_format(&snapshot_path, ImageFormat::Png)
-                .map_err(|err| format!("failed to replace snapshot for {}: {err}", file_name))?;
-            return Err(format!("snapshot was replaced for {}", file_name));
+                .map_err(|err| format!("failed to replace snapshot for {}: {err}", asset_name))?;
+            return Err(format!("snapshot was replaced for {}", asset_name));
         }
 
         return Err(format!(
             "pixel diff {} detected for {}",
-            pixel_diff, file_name
+            pixel_diff, asset_name
         ));
     }
 
     Ok(())
 }
 
-fn bitmap_to_dynamic_image(bitmap: Bitmap) -> DynamicImage {
+fn bitmap_to_dynamic_image(bitmap: Bitmap) -> Result<DynamicImage, String> {
+    fn from_icc(
+        icc: &[u8],
+        num_channels: u8,
+        has_alpha: bool,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Result<DynamicImage, String> {
+        let src_profile = ColorProfile::new_from_slice(icc)
+            .map_err(|_| "failed to read ICC profile".to_string())?;
+        let dest_profile = ColorProfile::new_srgb();
+
+        let src_layout = match num_channels {
+            1 => Layout::Gray,
+            2 => Layout::GrayAlpha,
+            3 => Layout::Rgb,
+            4 => Layout::Rgba,
+            _ => return Err("unsupported source layout".to_string()),
+        };
+
+        let dest_layout = if has_alpha { Layout::Rgba } else { Layout::Rgb };
+        let out_channels = if has_alpha { 4 } else { 3 };
+
+        let transform = src_profile
+            .create_transform_8bit(
+                src_layout,
+                &dest_profile,
+                dest_layout,
+                TransformOptions::default(),
+            )
+            .map_err(|_| "failed to create colour transform".to_string())?;
+
+        let mut dest = vec![0; (width * height * out_channels) as usize];
+        transform
+            .transform(data, &mut dest)
+            .map_err(|_| "failed to run colour transform".to_string())?;
+
+        let image = if has_alpha {
+            DynamicImage::ImageRgba8(
+                ImageBuffer::from_raw(width, height, dest)
+                    .ok_or_else(|| "failed to build rgba buffer".to_string())?,
+            )
+        } else {
+            DynamicImage::ImageRgb8(
+                ImageBuffer::from_raw(width, height, dest)
+                    .ok_or_else(|| "failed to build rgb buffer".to_string())?,
+            )
+        };
+
+        Ok(image)
+    }
+
     let Bitmap { channels, metadata } = bitmap;
     let (width, height) = (metadata.width, metadata.height);
 
-    let has_alpha = channels.iter().any(|c| c.is_alpha);
+    let mut has_alpha = channels.iter().any(|c| c.is_alpha);
     let num_channels = channels.len();
+
+    if let Some(expected_channels) = metadata
+        .colour_specification
+        .as_ref()
+        .and_then(|c| c.method.expected_number_of_channels())
+        && (expected_channels as usize) < num_channels
+    {
+        has_alpha = true;
+    }
 
     let channels = channels
         .into_iter()
@@ -260,44 +390,69 @@ fn bitmap_to_dynamic_image(bitmap: Bitmap) -> DynamicImage {
         interleaved
     };
 
-    match (num_channels, has_alpha) {
-        (1, false) => {
-            DynamicImage::ImageLuma8(ImageBuffer::from_raw(width, height, interleaved).unwrap())
-        }
-        (2, true) => {
-            DynamicImage::ImageLumaA8(ImageBuffer::from_raw(width, height, interleaved).unwrap())
-        }
-        (3, false) => {
-            DynamicImage::ImageRgb8(ImageBuffer::from_raw(width, height, interleaved).unwrap())
-        }
-        (4, true) => {
-            DynamicImage::ImageRgba8(ImageBuffer::from_raw(width, height, interleaved).unwrap())
-        }
-        (4, false) => {
-            let src_profile = ColorProfile::new_from_slice(include_bytes!(
-                "../assets/CGATS001Compat-v2-micro.icc"
-            ))
-            .unwrap();
-            let dest_profile = ColorProfile::new_srgb();
+    if let Some(spec) = &metadata.colour_specification {
+        match &spec.method {
+            ColourSpecificationMethod::IccProfile(icc) => {
+                let res = from_icc(
+                    icc.as_slice(),
+                    num_channels as u8,
+                    has_alpha,
+                    width,
+                    height,
+                    &interleaved,
+                );
 
-            let src_layout = Layout::Rgba;
-            let transform = src_profile
-                .create_transform_8bit(
-                    src_layout,
-                    &dest_profile,
-                    Layout::Rgb,
-                    TransformOptions::default(),
-                )
-                .unwrap();
-
-            let mut dest = vec![0; (width * height * 3) as usize];
-
-            transform.transform(&interleaved, &mut dest).unwrap();
-
-            DynamicImage::ImageRgb8(ImageBuffer::from_raw(width, height, dest).unwrap())
+                if let Ok(res) = res {
+                    return Ok(res);
+                }
+            }
+            ColourSpecificationMethod::Enumerated(space) => {
+                if matches!(*space, EnumeratedColourspace::RommRgb) {
+                    return from_icc(
+                        ROMM_PROFILE,
+                        num_channels as u8,
+                        has_alpha,
+                        width,
+                        height,
+                        &interleaved,
+                    );
+                }
+            }
+            _ => {}
         }
-        _ => unimplemented!(),
     }
+
+    let image = match (num_channels, has_alpha) {
+        (1, false) => DynamicImage::ImageLuma8(
+            ImageBuffer::from_raw(width, height, interleaved)
+                .ok_or_else(|| "failed to build grayscale buffer".to_string())?,
+        ),
+        (2, true) => DynamicImage::ImageLumaA8(
+            ImageBuffer::from_raw(width, height, interleaved)
+                .ok_or_else(|| "failed to build grayscale-alpha buffer".to_string())?,
+        ),
+        (3, false) => DynamicImage::ImageRgb8(
+            ImageBuffer::from_raw(width, height, interleaved)
+                .ok_or_else(|| "failed to build rgb buffer".to_string())?,
+        ),
+        (4, true) => DynamicImage::ImageRgba8(
+            ImageBuffer::from_raw(width, height, interleaved)
+                .ok_or_else(|| "failed to build rgba buffer".to_string())?,
+        ),
+        (4, false) => {
+            return from_icc(
+                CMYK_PROFILE,
+                num_channels as u8,
+                has_alpha,
+                width,
+                height,
+                &interleaved,
+            );
+        }
+        _ => return Err("unsupported channel configuration".to_string()),
+    };
+
+    Ok(image)
 }
 
 fn get_diff(expected_image: &RgbaImage, actual_image: &RgbaImage) -> (RgbaImage, u32) {

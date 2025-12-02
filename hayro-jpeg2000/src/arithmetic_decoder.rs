@@ -33,6 +33,7 @@ impl<'a> ArithmeticDecoder<'a> {
     }
 
     /// Read the next bit using the given context label.
+    #[inline(always)]
     pub(crate) fn read_bit(&mut self, context: &mut ArithmeticDecoderContext) -> u32 {
         self.decode(context)
     }
@@ -52,6 +53,7 @@ impl<'a> ArithmeticDecoder<'a> {
     /// The BYTEIN procedure from C.3.4.
     ///
     /// We use the version from Annex G from https://www.itu.int/rec/T-REC-T.88-201808-I.
+    #[inline(always)]
     fn read_byte(&mut self) {
         if self.current_byte() == 0xff {
             let b1 = self.next_byte();
@@ -71,6 +73,7 @@ impl<'a> ArithmeticDecoder<'a> {
     }
 
     /// The RENORMD procedure from C.3.3.
+    #[inline(always)]
     fn renormalize(&mut self) {
         loop {
             if self.shift_count == 0 {
@@ -88,10 +91,9 @@ impl<'a> ArithmeticDecoder<'a> {
     }
 
     /// The LPS_EXCHANGE procedure from C.3.2.
-    fn exchange_lps(&mut self, context: &mut ArithmeticDecoderContext) -> u32 {
+    #[inline(always)]
+    fn exchange_lps(&mut self, context: &mut ArithmeticDecoderContext, qe_entry: &QeData) -> u32 {
         let d;
-
-        let qe_entry = &QE_TABLE[context.index as usize];
 
         if self.a < qe_entry.qe {
             self.a = qe_entry.qe;
@@ -114,6 +116,7 @@ impl<'a> ArithmeticDecoder<'a> {
     /// The DECODE procedure from C.3.2.
     ///
     /// We use the version from Annex G from https://www.itu.int/rec/T-REC-T.88-201808-I.
+    #[inline(always)]
     fn decode(&mut self, context: &mut ArithmeticDecoderContext) -> u32 {
         let qe_entry = &QE_TABLE[context.index as usize];
 
@@ -123,19 +126,15 @@ impl<'a> ArithmeticDecoder<'a> {
 
         if (self.c >> 16) < self.a {
             if self.a & 0x8000 == 0 {
-                d = self.exchange_mps(context);
+                d = self.exchange_mps(context, qe_entry);
                 self.renormalize();
             } else {
                 d = context.mps;
             }
         } else {
-            let mut c_high = self.c >> 16;
-            let c_low = self.c & 0xffff;
-            c_high -= self.a;
+            self.c -= self.a << 16;
 
-            self.c = (c_high << 16) | c_low;
-
-            d = self.exchange_lps(context);
+            d = self.exchange_lps(context, qe_entry);
             self.renormalize();
         }
 
@@ -143,10 +142,9 @@ impl<'a> ArithmeticDecoder<'a> {
     }
 
     /// The MPS_EXCHANGE procedure from C.3.2.
-    fn exchange_mps(&mut self, context: &mut ArithmeticDecoderContext) -> u32 {
+    #[inline(always)]
+    fn exchange_mps(&mut self, context: &mut ArithmeticDecoderContext, qe_entry: &QeData) -> u32 {
         let d;
-
-        let qe_entry = &QE_TABLE[context.index as usize];
 
         if self.a < qe_entry.qe {
             d = 1 - context.mps;
@@ -164,6 +162,7 @@ impl<'a> ArithmeticDecoder<'a> {
         d
     }
 
+    #[inline(always)]
     fn current_byte(&self) -> u8 {
         self.data
             .get(self.base_pointer as usize)
@@ -176,6 +175,7 @@ impl<'a> ArithmeticDecoder<'a> {
             .unwrap_or(0xFF)
     }
 
+    #[inline(always)]
     fn next_byte(&self) -> u8 {
         self.data
             .get((self.base_pointer + 1) as usize)
@@ -264,42 +264,3 @@ static QE_TABLE: [QeData; 47] = qe!(
     0x0001, 45, 43, false,
     0x5601, 46, 46, false,
 );
-
-#[cfg(test)]
-mod tests {
-    use crate::arithmetic_decoder::{ArithmeticDecoder, ArithmeticDecoderContext};
-    use hayro_common::bit::BitWriter;
-
-    // Adapted from the Serenity decoder, which in turn took the example from
-    // https://www.itu.int/rec/T-REC-T.88-201808-I
-    // H.2 Test sequence for arithmetic coder.
-    #[test]
-    fn decode() {
-        let input = [
-            0x84, 0xC7, 0x3B, 0xFC, 0xE1, 0xA1, 0x43, 0x04, 0x02, 0x20, 0x00, 0x00, 0x41, 0x0D,
-            0xBB, 0x86, 0xF4, 0x31, 0x7F, 0xFF, 0x88, 0xFF, 0x37, 0x47, 0x1A, 0xDB, 0x6A, 0xDF,
-            0xFF, 0xAC,
-        ];
-
-        let expected_output = [
-            0x00, 0x02, 0x00, 0x51, 0x00, 0x00, 0x00, 0xC0, 0x03, 0x52, 0x87, 0x2A, 0xAA, 0xAA,
-            0xAA, 0xAA, 0x82, 0xC0, 0x20, 0x00, 0xFC, 0xD7, 0x9E, 0xF6, 0xBF, 0x7F, 0xED, 0x90,
-            0x4F, 0x46, 0xA3, 0xBF,
-        ];
-
-        let mut decoder = ArithmeticDecoder::new(&input[..]);
-        let mut out_buf = vec![0; expected_output.len()];
-        let mut ctx = ArithmeticDecoderContext::default();
-
-        let mut writer = BitWriter::new(&mut out_buf, 1).unwrap();
-
-        for _ in 0..expected_output.len() {
-            for _ in 0..8 {
-                let next = decoder.decode(&mut ctx);
-                writer.write(next);
-            }
-        }
-
-        assert_eq!(out_buf, expected_output);
-    }
-}

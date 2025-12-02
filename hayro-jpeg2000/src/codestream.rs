@@ -1,16 +1,21 @@
+use crate::DecodeSettings;
 use crate::bitmap::ChannelData;
+use crate::bitplane::BITPLANE_BIT_SIZE;
 use crate::decode::{SubBandType, decode};
-use hayro_common::byte::Reader;
+use crate::reader::BitReader;
 
-pub(crate) fn read(stream: &[u8]) -> Result<(Header, Vec<ChannelData>), &'static str> {
-    let mut reader = Reader::new(stream);
+pub(crate) fn read(
+    stream: &[u8],
+    settings: &DecodeSettings,
+) -> Result<(Header, Vec<ChannelData>), &'static str> {
+    let mut reader = BitReader::new(stream);
 
     let marker = reader.read_marker()?;
     if marker != markers::SOC {
         return Err("invalid marker: expected SOC marker");
     }
 
-    let header = read_header(&mut reader)?;
+    let header = read_header(&mut reader, settings)?;
     let code_stream_data = reader
         .tail()
         .ok_or("code stream data is missing from image")?;
@@ -24,9 +29,11 @@ pub(crate) struct Header {
     pub(crate) size_data: SizeData,
     pub(crate) global_coding_style: CodingStyleDefault,
     pub(crate) component_infos: Vec<ComponentInfo>,
+    /// Whether strict mode is enabled for decoding.
+    pub(crate) strict: bool,
 }
 
-fn read_header(reader: &mut Reader) -> Result<Header, &'static str> {
+fn read_header(reader: &mut BitReader, settings: &DecodeSettings) -> Result<Header, &'static str> {
     if reader.read_marker()? != markers::SIZ {
         return Err("expected SIZ marker after SOC");
     }
@@ -51,7 +58,9 @@ fn read_header(reader: &mut Reader) -> Result<Header, &'static str> {
                 reader.read_marker()?;
                 let (component_index, coc) =
                     coc_marker(reader, num_components).ok_or("failed to read COC marker")?;
-                cod_components[component_index as usize] = Some(coc);
+                *cod_components
+                    .get_mut(component_index as usize)
+                    .ok_or("invalid COC marker")? = Some(coc);
             }
             markers::QCD => {
                 reader.read_marker()?;
@@ -61,7 +70,9 @@ fn read_header(reader: &mut Reader) -> Result<Header, &'static str> {
                 reader.read_marker()?;
                 let (component_index, qcc) =
                     qcc_marker(reader, num_components).ok_or("failed to read QCC marker")?;
-                qcd_components[component_index as usize] = Some(qcc);
+                *qcd_components
+                    .get_mut(component_index as usize)
+                    .ok_or("invalid COC marker")? = Some(qcc);
             }
             markers::RGN => {
                 reader.read_marker()?;
@@ -110,6 +121,7 @@ fn read_header(reader: &mut Reader) -> Result<Header, &'static str> {
         size_data,
         global_coding_style: cod.clone(),
         component_infos,
+        strict: settings.strict,
     };
 
     validate(&header)?;
@@ -132,7 +144,11 @@ fn validate(header: &Header) -> Result<(), &'static str> {
             // See the accesses in the `exponent_mantissa` method. The largest
             // access is 1 + (max_resolution_idx - 1) * 3 + 2.
 
-            if 1 + (max_resolution_idx as usize - 1) * 3 + 2 >= num_precinct_exponents {
+            if max_resolution_idx == 0 {
+                if num_precinct_exponents == 0 {
+                    return Err("not enough exponents were provided in header");
+                }
+            } else if 1 + (max_resolution_idx as usize - 1) * 3 + 2 >= num_precinct_exponents {
                 return Err("not enough exponents were provided in header");
             }
         }
@@ -195,6 +211,10 @@ impl ComponentInfo {
 
     pub(crate) fn num_resolution_levels(&self) -> u16 {
         self.coding_style.parameters.num_resolution_levels
+    }
+
+    pub(crate) fn num_decomposition_levels(&self) -> u16 {
+        self.coding_style.parameters.num_decomposition_levels
     }
 
     pub(crate) fn code_block_style(&self) -> CodeBlockStyle {
@@ -373,6 +393,10 @@ pub(crate) struct SizeData {
     pub(crate) tile_y_offset: u32,
     /// Component information (SSiz/XRSiz/YRSiz).
     pub(crate) component_sizes: Vec<ComponentSizeInfo>,
+    /// Shrink factor in the x direction. See the comment in the parsing method.
+    pub(crate) x_shrink_factor: u32,
+    /// Shrink factor in the y direction. See the comment in the parsing method.
+    pub(crate) y_shrink_factor: u32,
 }
 
 impl SizeData {
@@ -417,17 +441,17 @@ impl SizeData {
 
     /// Return the overall width of the image.
     pub(crate) fn image_width(&self) -> u32 {
-        self.reference_grid_width - self.image_area_x_offset
+        (self.reference_grid_width - self.image_area_x_offset).div_ceil(self.x_shrink_factor)
     }
 
     /// Return the overall height of the image.
     pub(crate) fn image_height(&self) -> u32 {
-        self.reference_grid_height - self.image_area_y_offset
+        (self.reference_grid_height - self.image_area_y_offset).div_ceil(self.y_shrink_factor)
     }
 }
 
 /// SIZ marker (A.5.1).
-fn size_marker(reader: &mut Reader) -> Result<SizeData, &'static str> {
+fn size_marker(reader: &mut BitReader) -> Result<SizeData, &'static str> {
     let size_data = size_marker_inner(reader).ok_or("failed to read SIZ marker")?;
 
     if size_data.tile_width == 0
@@ -467,10 +491,18 @@ fn size_marker(reader: &mut Reader) -> Result<SizeData, &'static str> {
         }
     }
 
+    const MAX_DIMENSIONS: usize = 60000;
+
+    if size_data.image_width() as usize > MAX_DIMENSIONS
+        || size_data.image_height() as usize > MAX_DIMENSIONS
+    {
+        return Err("image is too large");
+    }
+
     Ok(size_data)
 }
 
-fn size_marker_inner(reader: &mut Reader) -> Option<SizeData> {
+fn size_marker_inner(reader: &mut BitReader) -> Option<SizeData> {
     // Length.
     let _ = reader.read_u16()?;
     // Decoder capabilities.
@@ -486,6 +518,10 @@ fn size_marker_inner(reader: &mut Reader) -> Option<SizeData> {
     let yto_siz = reader.read_u32()?;
     let csiz = reader.read_u16()?;
 
+    if csiz == 0 {
+        return None;
+    }
+
     let mut components = Vec::with_capacity(csiz as usize);
     for _ in 0..csiz {
         let ssiz = reader.read_byte()?;
@@ -495,9 +531,8 @@ fn size_marker_inner(reader: &mut Reader) -> Option<SizeData> {
         let precision = (ssiz & 0x7F) + 1;
         let is_signed = (ssiz & 0x80) != 0;
 
-        if (x_rsiz != 1 || y_rsiz != 1) && (x_osiz != 0 || y_osiz != 0) {
-            // Those are probably very rare. Let's wait until we have a test case
-            // before attempting to implement it.
+        // In theory up to 38 is allowed, but we don't support more than that.
+        if precision as u32 > BITPLANE_BIT_SIZE {
             return None;
         }
 
@@ -507,6 +542,28 @@ fn size_marker_inner(reader: &mut Reader) -> Option<SizeData> {
             horizontal_resolution: x_rsiz,
             vertical_resolution: y_rsiz,
         });
+    }
+
+    // In case all components are sub-sampled at the same level, we
+    // don't want to render them at the original resolution but instead
+    // reduce their dimension so that we can assume a resolution of 1 for
+    // all components. This makes the images much smaller.
+
+    let mut x_shrink_factor = 1;
+    let mut y_shrink_factor = 1;
+
+    let hr = components[0].horizontal_resolution;
+    let vr = components[0].vertical_resolution;
+    let mut same_resolution = true;
+
+    for component in &components[1..] {
+        same_resolution &= component.horizontal_resolution == hr;
+        same_resolution &= component.vertical_resolution == vr;
+    }
+
+    if same_resolution {
+        x_shrink_factor = hr as u32;
+        y_shrink_factor = vr as u32;
     }
 
     Some(SizeData {
@@ -519,11 +576,13 @@ fn size_marker_inner(reader: &mut Reader) -> Option<SizeData> {
         tile_x_offset: xto_siz,
         tile_y_offset: yto_siz,
         component_sizes: components,
+        x_shrink_factor,
+        y_shrink_factor,
     })
 }
 
 fn coding_style_parameters(
-    reader: &mut Reader,
+    reader: &mut BitReader,
     coding_style: &CodingStyleFlags,
 ) -> Option<CodingStyleParameters> {
     let num_decomposition_levels = (reader.read_byte()? as u16).min(32);
@@ -562,21 +621,21 @@ fn coding_style_parameters(
 }
 
 /// COM Marker (A.9.2).
-fn com_marker(reader: &mut Reader) -> Option<()> {
+fn com_marker(reader: &mut BitReader) -> Option<()> {
     skip_marker_segment(reader)
 }
 
 /// TLM marker (A.7.1).
-fn tlm_marker(reader: &mut Reader) -> Option<()> {
+fn tlm_marker(reader: &mut BitReader) -> Option<()> {
     skip_marker_segment(reader)
 }
 
 /// RGN marker (A.6.3).
-fn rgn_marker(reader: &mut Reader) -> Option<()> {
+fn rgn_marker(reader: &mut BitReader) -> Option<()> {
     skip_marker_segment(reader)
 }
 
-pub(crate) fn skip_marker_segment(reader: &mut Reader) -> Option<()> {
+pub(crate) fn skip_marker_segment(reader: &mut BitReader) -> Option<()> {
     let length = reader.read_u16()?.checked_sub(2)?;
     reader.skip_bytes(length as usize)?;
 
@@ -584,7 +643,7 @@ pub(crate) fn skip_marker_segment(reader: &mut Reader) -> Option<()> {
 }
 
 /// COD marker (A.6.1).
-pub(crate) fn cod_marker(reader: &mut Reader) -> Option<CodingStyleDefault> {
+pub(crate) fn cod_marker(reader: &mut BitReader) -> Option<CodingStyleDefault> {
     // Length.
     let _ = reader.read_u16()?;
 
@@ -608,7 +667,7 @@ pub(crate) fn cod_marker(reader: &mut Reader) -> Option<CodingStyleDefault> {
 }
 
 /// COC marker (A.6.2).
-pub(crate) fn coc_marker(reader: &mut Reader, csiz: u16) -> Option<(u16, CodingStyleComponent)> {
+pub(crate) fn coc_marker(reader: &mut BitReader, csiz: u16) -> Option<(u16, CodingStyleComponent)> {
     // Length.
     let _ = reader.read_u16()?;
 
@@ -631,7 +690,7 @@ pub(crate) fn coc_marker(reader: &mut Reader, csiz: u16) -> Option<(u16, CodingS
 }
 
 /// QCD marker (A.6.4).
-pub(crate) fn qcd_marker(reader: &mut Reader) -> Option<QuantizationInfo> {
+pub(crate) fn qcd_marker(reader: &mut BitReader) -> Option<QuantizationInfo> {
     // Length.
     let length = reader.read_u16()?;
 
@@ -648,7 +707,7 @@ pub(crate) fn qcd_marker(reader: &mut Reader) -> Option<QuantizationInfo> {
 }
 
 /// QCC marker (A.6.5).
-pub(crate) fn qcc_marker(reader: &mut Reader, csiz: u16) -> Option<(u16, QuantizationInfo)> {
+pub(crate) fn qcc_marker(reader: &mut BitReader, csiz: u16) -> Option<(u16, QuantizationInfo)> {
     let length = reader.read_u16()?;
 
     let component_index = if csiz < 257 {
@@ -674,7 +733,7 @@ pub(crate) fn qcc_marker(reader: &mut Reader, csiz: u16) -> Option<(u16, Quantiz
 }
 
 fn quantization_parameters(
-    reader: &mut Reader,
+    reader: &mut BitReader,
     quantization_style: QuantizationStyle,
     remaining_bytes: usize,
 ) -> Option<QuantizationInfo> {
@@ -734,7 +793,7 @@ pub(crate) trait ReaderExt: Clone {
     }
 }
 
-impl ReaderExt for Reader<'_> {
+impl ReaderExt for BitReader<'_> {
     fn read_marker(&mut self) -> Result<u8, &'static str> {
         if self.peek_byte().ok_or("invalid marker")? != 0xFF {
             return Err("invalid marker");

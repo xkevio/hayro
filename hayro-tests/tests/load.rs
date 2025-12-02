@@ -321,6 +321,48 @@ fn issue520() {
 }
 
 #[test]
+fn issue538() {
+    let file = include_bytes!("../pdfs/load/issue538.pdf");
+    load(file);
+}
+
+#[test]
+fn issue563() {
+    let file = include_bytes!("../pdfs/load/issue563.pdf");
+    load(file);
+}
+
+#[test]
+fn issue564() {
+    let file = include_bytes!("../pdfs/load/issue564.pdf");
+    load(file);
+}
+
+#[test]
+fn issue577() {
+    let file = include_bytes!("../pdfs/load/issue577.pdf");
+    load(file);
+}
+
+#[test]
+fn issue578() {
+    let file = include_bytes!("../pdfs/load/issue578.pdf");
+    load(file);
+}
+
+#[test]
+fn issue579() {
+    let file = include_bytes!("../pdfs/load/issue579.pdf");
+    load(file);
+}
+
+#[test]
+fn issue585() {
+    let file = include_bytes!("../pdfs/load/issue585.pdf");
+    load(file);
+}
+
+#[test]
 fn page_tree_cycle() {
     let file = include_bytes!("../pdfs/load/page_tree_cycle.pdf");
     load(file);

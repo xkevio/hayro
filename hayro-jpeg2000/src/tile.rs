@@ -3,22 +3,21 @@
 use crate::codestream::{
     ComponentInfo, Header, ProgressionOrder, ReaderExt, markers, skip_marker_segment,
 };
-use crate::decode::SubBandType;
+use crate::decode::{PrecinctData, SubBandType};
+use crate::reader::BitReader;
 use crate::rect::IntRect;
-use hayro_common::byte::Reader;
-use log::warn;
 
 /// A single tile in the image.
 #[derive(Clone, Debug)]
 pub(crate) struct Tile<'a> {
+    /// The index of the tile, in row-major order.
     pub(crate) idx: u32,
     /// The concatenated tile parts that contain all the information for all
     /// constituent codeblocks.
-    pub(crate) tile_parts: Vec<&'a [u8]>,
+    pub(crate) tile_parts: Vec<TilePart<'a>>,
     /// Parameters for each component. In most cases, those are directly
     /// inherited from the main header. But in some cases, individual tiles
     /// might override them.
-    // TODO: Don't store size_info
     pub(crate) component_infos: Vec<ComponentInfo>,
     /// The rectangle making up the area of the tile. `x1` and `y1` are
     /// exclusive.
@@ -26,6 +25,41 @@ pub(crate) struct Tile<'a> {
     pub(crate) progression_order: ProgressionOrder,
     pub(crate) num_layers: u16,
     pub(crate) mct: bool,
+}
+
+/// A tile part where packet headers and packet data are interleaved.
+#[derive(Clone, Debug)]
+pub(crate) struct MergedTilePart<'a> {
+    pub(crate) data: BitReader<'a>,
+}
+
+/// A tile part where packet headers and packet data are separated.
+#[derive(Clone, Debug)]
+pub(crate) struct SeparatedTilePart<'a> {
+    pub(crate) header: BitReader<'a>,
+    pub(crate) body: BitReader<'a>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TilePart<'a> {
+    Merged(MergedTilePart<'a>),
+    Separated(SeparatedTilePart<'a>),
+}
+
+impl<'a> TilePart<'a> {
+    pub(crate) fn header(&mut self) -> &mut BitReader<'a> {
+        match self {
+            TilePart::Merged(m) => &mut m.data,
+            TilePart::Separated(s) => &mut s.header,
+        }
+    }
+
+    pub(crate) fn body(&mut self) -> &mut BitReader<'a> {
+        match self {
+            TilePart::Merged(m) => &mut m.data,
+            TilePart::Separated(s) => &mut s.body,
+        }
+    }
 }
 
 impl<'a> Tile<'a> {
@@ -74,7 +108,6 @@ impl<'a> Tile<'a> {
         }
     }
 
-    /// Return an iterator over the component tiles.
     pub(crate) fn component_tiles(&self) -> impl Iterator<Item = ComponentTile<'_>> {
         self.component_infos
             .iter()
@@ -84,32 +117,30 @@ impl<'a> Tile<'a> {
 
 /// Create the tiles and parse their constituent tile parts.
 pub(crate) fn parse<'a>(
-    reader: &mut Reader<'a>,
+    reader: &mut BitReader<'a>,
     main_header: &'a Header,
 ) -> Result<Vec<Tile<'a>>, &'static str> {
     let mut tiles = (0..main_header.size_data.num_tiles() as usize)
         .map(|idx| Tile::new(idx as u32, main_header))
         .collect::<Vec<_>>();
 
-    parse_tile_part(reader, main_header, &mut tiles, true)?;
+    parse_tile_part(reader, main_header, &mut tiles)?;
 
     while reader.peek_marker() == Some(markers::SOT) {
-        parse_tile_part(reader, main_header, &mut tiles, false)?;
+        parse_tile_part(reader, main_header, &mut tiles)?;
     }
 
-    // TODO: Add this for strict mode.
-    // if reader.read_marker()? != markers::EOC {
-    //     return Err("expected EOC marker when parsing tiles");
-    // }
+    if main_header.strict && reader.read_marker()? != markers::EOC {
+        return Err("expected EOC marker when parsing tiles");
+    }
 
     Ok(tiles)
 }
 
 fn parse_tile_part<'a>(
-    reader: &mut Reader<'a>,
+    reader: &mut BitReader<'a>,
     main_header: &Header,
     tiles: &mut [Tile<'a>],
-    first: bool,
 ) -> Result<(), &'static str> {
     if reader.read_marker()? != markers::SOT {
         return Err("expected SOT marker at tile-part start");
@@ -136,14 +167,15 @@ fn parse_tile_part<'a>(
     let tile = &mut tiles[tile_part_header.tile_index as usize];
     let num_components = tile.component_infos.len();
 
+    let mut ppt_header = None;
+
     loop {
         let Some(marker) = reader.peek_marker() else {
-            warn!(
-                "expected marker in tile-part, but didn't find one. tile \
-            part will be ignored."
-            );
-
-            return Ok(());
+            return if main_header.strict {
+                Err("failed to parse tile part")
+            } else {
+                Ok(())
+            };
         };
 
         match marker {
@@ -158,18 +190,13 @@ fn parse_tile_part<'a>(
                 let cod =
                     crate::codestream::cod_marker(reader).ok_or("failed to read COD marker")?;
 
-                if first {
-                    tile.mct = cod.mct;
-                    tile.num_layers = cod.num_layers;
-                    tile.progression_order = cod.progression_order;
+                tile.mct = cod.mct;
+                tile.num_layers = cod.num_layers;
+                tile.progression_order = cod.progression_order;
 
-                    for component in &mut tile.component_infos {
-                        component.coding_style.flags.raw |= cod.component_parameters.flags.raw;
-                        component.coding_style.parameters =
-                            cod.component_parameters.clone().parameters;
-                    }
-                } else {
-                    warn!("encountered unexpected COD marker in tile-part header");
+                for component in &mut tile.component_infos {
+                    component.coding_style.flags.raw |= cod.component_parameters.flags.raw;
+                    component.coding_style.parameters = cod.component_parameters.clone().parameters;
                 }
             }
             markers::COC => {
@@ -179,29 +206,21 @@ fn parse_tile_part<'a>(
                     crate::codestream::coc_marker(reader, num_components as u16)
                         .ok_or("failed to read COC marker")?;
 
-                if first {
-                    let old = tile
-                        .component_infos
-                        .get_mut(component_index as usize)
-                        .ok_or("invalid component index in tile-part header")?;
+                let old = tile
+                    .component_infos
+                    .get_mut(component_index as usize)
+                    .ok_or("invalid component index in tile-part header")?;
 
-                    old.coding_style.parameters = coc.parameters;
-                    old.coding_style.flags.raw |= coc.flags.raw;
-                } else {
-                    warn!("encountered unexpected COC marker in tile-part header");
-                }
+                old.coding_style.parameters = coc.parameters;
+                old.coding_style.flags.raw |= coc.flags.raw;
             }
             markers::QCD => {
                 reader.read_marker()?;
                 let qcd =
                     crate::codestream::qcd_marker(reader).ok_or("failed to read QCD marker")?;
 
-                if first {
-                    for component_info in &mut tile.component_infos {
-                        component_info.quantization_info = qcd.clone();
-                    }
-                } else {
-                    warn!("encountered unexpected QCD marker in tile-part header");
+                for component_info in &mut tile.component_infos {
+                    component_info.quantization_info = qcd.clone();
                 }
             }
             markers::QCC => {
@@ -210,20 +229,29 @@ fn parse_tile_part<'a>(
                     crate::codestream::qcc_marker(reader, num_components as u16)
                         .ok_or("failed to read QCC marker")?;
 
-                if first {
-                    tile.component_infos
-                        .get_mut(component_index as usize)
-                        .ok_or("invalid component index in tile-part header")?
-                        .quantization_info = qcc.clone();
-                } else {
-                    warn!("encountered unexpected QCC marker in tile-part header");
-                }
+                tile.component_infos
+                    .get_mut(component_index as usize)
+                    .ok_or("invalid component index in tile-part header")?
+                    .quantization_info = qcc.clone();
             }
             markers::EOC => break,
-            _ => {
+            markers::PPT => {
+                reader.read_marker()?;
+                ppt_header = Some(ppt_marker(reader).ok_or("failed to read PPT marker")?);
+            }
+            markers::PLT => {
+                // Can be inferred ourselves.
                 reader.read_marker()?;
                 skip_marker_segment(reader)
-                    .ok_or("failed to skip a marker during tile part parsing")?;
+                    .ok_or("failed to skip PLT marker during tile part parsing")?;
+            }
+            markers::COM => {
+                reader.read_marker()?;
+                skip_marker_segment(reader)
+                    .ok_or("failed to skip COM marker during tile part parsing")?;
+            }
+            _ => {
+                return Err("unsupported marker encountered");
             }
         }
     }
@@ -231,16 +259,29 @@ fn parse_tile_part<'a>(
     let remaining_bytes = if let Some(len) = data_len.checked_sub(reader.offset() - start) {
         len
     } else {
-        warn!("didn't find sufficient data in tile part");
-
-        return Ok(());
+        return if main_header.strict {
+            Err("didn't find sufficient data in tile part")
+        } else {
+            Ok(())
+        };
     };
 
-    tile.tile_parts.push(
-        reader
-            .read_bytes(remaining_bytes)
-            .ok_or("failed to get tile part data")?,
-    );
+    let data = reader
+        .read_bytes(remaining_bytes)
+        .ok_or("failed to get tile part data")?;
+
+    let tile_part = if let Some(ppt_header) = ppt_header {
+        TilePart::Separated(SeparatedTilePart {
+            header: BitReader::new(ppt_header),
+            body: BitReader::new(data),
+        })
+    } else {
+        TilePart::Merged(MergedTilePart {
+            data: BitReader::new(data),
+        })
+    };
+
+    tile.tile_parts.push(tile_part);
 
     Ok(())
 }
@@ -248,7 +289,6 @@ fn parse_tile_part<'a>(
 /// A tile, instantiated to a specific component.
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct ComponentTile<'a> {
-    /// The underlying tile.
     pub(crate) tile: &'a Tile<'a>,
     /// The information of the component of the tile.
     pub(crate) component_info: &'a ComponentInfo,
@@ -289,7 +329,7 @@ impl<'a> ComponentTile<'a> {
         }
     }
 
-    pub(crate) fn resolution_tiles(&self) -> impl IntoIterator<Item = ResolutionTile<'_>> {
+    pub(crate) fn resolution_tiles(&self) -> impl Iterator<Item = ResolutionTile<'_>> {
         (0..self
             .component_info
             .coding_style
@@ -391,8 +431,15 @@ impl<'a> ResolutionTile<'a> {
             0
         };
 
-        let numerator_x = 2u64.pow(self.decomposition_level as u32 - 1) * xo_b as u64;
-        let numerator_y = 2u64.pow(self.decomposition_level as u32 - 1) * yo_b as u64;
+        let mut numerator_x = 0;
+        let mut numerator_y = 0;
+
+        // If decomposition level is 0, xo_b and yo_b are 0 as well.
+        if self.decomposition_level > 0 {
+            numerator_x = 2u64.pow(self.decomposition_level as u32 - 1) * xo_b as u64;
+            numerator_y = 2u64.pow(self.decomposition_level as u32 - 1) * yo_b as u64;
+        }
+
         let denominator = 2u64.pow(self.decomposition_level as u32);
 
         let tbx_0 = (self.component_tile.rect.x0 as u64)
@@ -414,7 +461,7 @@ impl<'a> ResolutionTile<'a> {
     /// The exponent for determining the horizontal size of a precinct.
     ///
     /// `PPx` in the specification.
-    pub(crate) fn precinct_exponent_x(&self) -> u8 {
+    fn precinct_exponent_x(&self) -> u8 {
         self.component_tile
             .component_info
             .coding_style
@@ -426,7 +473,7 @@ impl<'a> ResolutionTile<'a> {
     /// The exponent for determining the vertical size of a precinct.
     ///
     /// `PPx` in the specification.
-    pub(crate) fn precinct_exponent_y(&self) -> u8 {
+    fn precinct_exponent_y(&self) -> u8 {
         self.component_tile
             .component_info
             .coding_style
@@ -435,7 +482,7 @@ impl<'a> ResolutionTile<'a> {
             .1
     }
 
-    pub(crate) fn num_precincts_x(&self) -> u32 {
+    fn num_precincts_x(&self) -> u32 {
         // See B-16.
         let IntRect { x0, x1, .. } = self.rect;
 
@@ -447,7 +494,7 @@ impl<'a> ResolutionTile<'a> {
         }
     }
 
-    pub(crate) fn num_precincts_y(&self) -> u32 {
+    fn num_precincts_y(&self) -> u32 {
         // See B-16.
         let IntRect { y0, y1, .. } = self.rect;
 
@@ -461,6 +508,93 @@ impl<'a> ResolutionTile<'a> {
 
     pub(crate) fn num_precincts(&self) -> u32 {
         self.num_precincts_x() * self.num_precincts_y()
+    }
+
+    /// Return an iterator over the data of the precincts in this resolution
+    /// tile.
+    pub(crate) fn precincts(&self) -> impl Iterator<Item = PrecinctData> {
+        let num_precincts_y = self.num_precincts_y();
+        let num_precincts_x = self.num_precincts_x();
+
+        let mut ppx = self.precinct_exponent_x();
+        let mut ppy = self.precinct_exponent_y();
+
+        let mut y_start = (self.rect.y0 / (1 << ppy)) * (1 << ppy);
+        let mut x_start = (self.rect.x0 / (1 << ppx)) * (1 << ppx);
+
+        // It is unclear why this is necessary, but it is. The spec only
+        // mentions that ppx/ppy must be decreased when calculating codeblock
+        // dimensions, but not that it's necessary for precincts as well.
+        if self.resolution > 0 {
+            ppx -= 1;
+            ppy -= 1;
+
+            x_start /= 2;
+            y_start /= 2;
+        }
+
+        let ppx_pow2 = 1 << ppx;
+        let ppy_pow2 = 1 << ppy;
+
+        let precinct_x_step = self
+            .component_tile
+            .component_info
+            .size_info
+            .horizontal_resolution as u32
+            * (1 << (self.precinct_exponent_x() as u16
+                + self
+                    .component_tile
+                    .component_info
+                    .num_decomposition_levels()
+                - self.resolution));
+
+        let precinct_y_step = self
+            .component_tile
+            .component_info
+            .size_info
+            .vertical_resolution as u32
+            * (1 << (self.precinct_exponent_y() as u16
+                + self
+                    .component_tile
+                    .component_info
+                    .num_decomposition_levels()
+                - self.resolution));
+
+        // These variables are used to map the start coordinates of each
+        // precinct _on the reference grid_. Remember that the first
+        // precinct in each row/column is at the start position of the tile
+        // which might not be a multiple of precinct exponent, but all subsequent
+        // precincts are at a multiple of the exponent.
+        let r_x = self.component_tile.tile.rect.x0;
+        let mut r_y = self.component_tile.tile.rect.y0;
+
+        (0..num_precincts_y).flat_map(move |y| {
+            let y0 = y * ppy_pow2 + y_start;
+            let mut r_x = r_x;
+
+            let res = (0..num_precincts_x).map(move |x| {
+                let x0 = x * ppx_pow2 + x_start;
+
+                let data = PrecinctData {
+                    r_x,
+                    r_y,
+                    rect: IntRect::from_xywh(x0, y0, ppx_pow2, ppy_pow2),
+                    idx: num_precincts_x * y + x,
+                };
+
+                // If r_x is already aligned, we simply step by `precinct_x_step`.
+                // Otherwise (can only be the case for precincts in the first
+                // row or column), align to the next multiple.
+                r_x = (r_x + 1).next_multiple_of(precinct_x_step);
+
+                data
+            });
+
+            // Same as for r_x.
+            r_y = (r_y + 1).next_multiple_of(precinct_y_step);
+
+            res
+        })
     }
 
     pub(crate) fn code_block_width(&self) -> u32 {
@@ -505,8 +639,16 @@ struct TilePartHeader {
     tile_part_length: u32,
 }
 
+/// PPT marker (A.7.5).
+fn ppt_marker<'a>(reader: &mut BitReader<'a>) -> Option<&'a [u8]> {
+    let length = reader.read_u16()?.checked_sub(2)?;
+    let header_len = length.checked_sub(1)?;
+    let _sequence_idx = reader.read_byte()?;
+    reader.read_bytes(header_len as usize)
+}
+
 /// SOT marker (A.4.2).
-fn sot_marker(reader: &mut Reader) -> Option<TilePartHeader> {
+fn sot_marker(reader: &mut BitReader) -> Option<TilePartHeader> {
     // Length.
     let _ = reader.read_u16()?;
 
@@ -590,6 +732,8 @@ mod tests {
             tile_x_offset: 0,
             tile_y_offset: 0,
             component_sizes: vec![component_size_info_0, component_size_info_1],
+            x_shrink_factor: 1,
+            y_shrink_factor: 1,
         };
 
         assert_eq!(size_data.image_width(), 1280);
@@ -620,6 +764,7 @@ mod tests {
                 },
             },
             component_infos: vec![],
+            strict: false,
         };
 
         let tile_0_0 = Tile::new(0, &header);

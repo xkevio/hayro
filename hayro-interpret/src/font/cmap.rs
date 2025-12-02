@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 const MAX_MAP_RANGE: u32 = (1 << 24) - 1; // 0xFFFFFF
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct CMap {
     codespace_ranges: [Vec<u32>; 4],
     map: HashMap<u32, u32>,
@@ -44,6 +44,10 @@ impl CMap {
         self.vertical
     }
 
+    pub(crate) fn is_identity_cmap(&self) -> bool {
+        (self.name == "Identity-H" || self.name == "Identity-V") && self.map.is_empty()
+    }
+
     pub(crate) fn lookup_code(&self, code: u32) -> Option<u32> {
         if let Some(value) = self.map.get(&code) {
             Some(*value)
@@ -77,7 +81,7 @@ impl CMap {
         Some(())
     }
 
-    fn map_bf_range(&mut self, low: u32, high: u32, dst_low: String) -> Option<()> {
+    fn map_bf_range(&mut self, low: u32, high: u32, dst_low: u32) -> Option<()> {
         if high - low > MAX_MAP_RANGE {
             return None;
         }
@@ -86,21 +90,8 @@ impl CMap {
         let mut current_dst = dst_low;
 
         while current_low <= high {
-            self.map.insert(current_low, bf_string_char(&current_dst));
-
-            let mut bytes = current_dst.into_bytes();
-            if let Some(last_byte) = bytes.last_mut() {
-                if *last_byte == 0xff {
-                    if bytes.len() > 1 {
-                        let len = bytes.len();
-                        bytes[len - 2] += 1;
-                        bytes[len - 1] = 0x00;
-                    }
-                } else {
-                    *last_byte += 1;
-                }
-            }
-            current_dst = String::from_utf8_lossy(&bytes).to_string();
+            self.map.insert(current_low, current_dst);
+            current_dst += 1;
             current_low += 1;
         }
 
@@ -126,10 +117,6 @@ impl CMap {
 
     fn map_one(&mut self, src: u32, dst: u32) {
         self.map.insert(src, dst);
-    }
-
-    fn is_identity_cmap(&self) -> bool {
-        (self.name == "Identity-H" || self.name == "Identity-V") && self.map.is_empty()
     }
 
     pub fn read_code(&self, bytes: &[u8], offset: usize) -> (u32, usize) {
@@ -228,7 +215,7 @@ impl<'a> CMapLexer<'a> {
         if remaining.starts_with('%') {
             // Skip to end of line
             while self.position < self.input.len() {
-                let ch = self.input.chars().nth(self.position).unwrap();
+                let ch = self.input.as_bytes()[self.position] as char;
                 self.position += 1;
                 if ch == '\n' || ch == '\r' {
                     break;
@@ -276,7 +263,7 @@ impl<'a> CMapLexer<'a> {
 
     fn skip_whitespace(&mut self) {
         while self.position < self.input.len() {
-            let ch = self.input.chars().nth(self.position).unwrap();
+            let ch = self.input.as_bytes()[self.position] as char;
             if ch.is_whitespace() {
                 self.position += 1;
             } else {
@@ -297,7 +284,7 @@ impl<'a> CMapLexer<'a> {
         let mut hex_string = String::new();
 
         while self.position < self.input.len() {
-            let ch = self.input.chars().nth(self.position).unwrap();
+            let ch = self.input.as_bytes()[self.position] as char;
             if ch == '>' {
                 self.position += 1;
                 break;
@@ -331,7 +318,7 @@ impl<'a> CMapLexer<'a> {
         let mut paren_depth = 1;
 
         while self.position < self.input.len() && paren_depth > 0 {
-            let ch = self.input.chars().nth(self.position).unwrap();
+            let ch = self.input.as_bytes()[self.position] as char;
             match ch {
                 '(' => {
                     paren_depth += 1;
@@ -347,7 +334,7 @@ impl<'a> CMapLexer<'a> {
                     // Handle escape sequences
                     self.position += 1;
                     if self.position < self.input.len() {
-                        let escaped = self.input.chars().nth(self.position).unwrap();
+                        let escaped = self.input.as_bytes()[self.position] as char;
                         string.push('\\');
                         string.push(escaped);
                     }
@@ -370,7 +357,7 @@ impl<'a> CMapLexer<'a> {
         let mut name = String::new();
 
         while self.position < self.input.len() {
-            let ch = self.input.chars().nth(self.position).unwrap();
+            let ch = self.input.as_bytes()[self.position] as char;
             if ch.is_whitespace() || "[]<>(){}/%".contains(ch) {
                 break;
             }
@@ -385,7 +372,7 @@ impl<'a> CMapLexer<'a> {
         let mut token = String::new();
 
         while self.position < self.input.len() {
-            let ch = self.input.chars().nth(self.position).unwrap();
+            let ch = self.input.as_bytes()[self.position] as char;
             if ch.is_whitespace() || "[]<>(){}/%".contains(ch) {
                 break;
             }
@@ -452,13 +439,23 @@ fn parse_bf_range(cmap: &mut CMap, lexer: &mut CMapLexer) -> Option<()> {
 
                 let dst_obj = lexer.get_obj();
                 match dst_obj {
-                    Token::Integer(dst_int) => {
-                        let dst_low = char::from(dst_int as u8).to_string();
-                        cmap.map_bf_range(low, high, dst_low)?;
+                    Token::Integer(dst_low) => {
+                        cmap.map_bf_range(low, high, dst_low as u32)?;
                     }
                     ref token => {
                         if let Some(dst_str) = expect_string(token) {
-                            cmap.map_bf_range(low, high, dst_str)?;
+                            // For beginbfrange, if the destination is a short hex string (like <0003>),
+                            // it represents a Unicode code point, not a multi-byte string.
+                            if dst_str.chars().count() <= 2 {
+                                let code_point = str_to_int(&dst_str);
+                                if let Some(unicode_char) = char::from_u32(code_point) {
+                                    cmap.map_bf_range(low, high, unicode_char as u32)?;
+                                } else {
+                                    cmap.map_bf_range(low, high, bf_string_char(&dst_str))?;
+                                }
+                            } else {
+                                cmap.map_bf_range(low, high, bf_string_char(&dst_str))?;
+                            }
                         } else if let Token::Command(cmd) = token {
                             if cmd == "[" {
                                 let mut array = Vec::new();
@@ -584,6 +581,10 @@ fn parse_cmap_name(cmap: &mut CMap, lexer: &mut CMapLexer) -> Option<()> {
 }
 
 pub fn parse_cmap(input: &str) -> Option<CMap> {
+    if !input.is_ascii() {
+        return None;
+    }
+
     let mut cmap = CMap::new();
     let mut lexer = CMapLexer::new(input);
 

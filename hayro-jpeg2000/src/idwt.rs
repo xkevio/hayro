@@ -1,19 +1,38 @@
 //! Performing the inverse discrete wavelet transform, as specified in Annex F.
 
 use crate::codestream::WaveletTransform;
-use crate::decode::{Decomposition, SubBand, SubBandType};
+use crate::decode::{Decomposition, DecompositionStorage, SubBand, SubBandType, TileDecodeContext};
 use crate::rect::IntRect;
-use std::iter;
 
-/// The amount of padding to apply to a single scanline to make filtering at
-/// the boundary possible.
-const PADDING_SHIFT: usize = 4;
+// Keep in sync with the type `F32` in the `simd` modules!
+const SIMD_WIDTH: usize = 8;
+
+#[derive(Default, Copy, Clone)]
+pub(crate) struct Padding {
+    pub(crate) left: usize,
+    pub(crate) top: usize,
+    pub(crate) right: usize,
+    pub(crate) bottom: usize,
+}
+
+impl Padding {
+    fn new(left: usize, top: usize, right: usize, bottom: usize) -> Self {
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+}
 
 /// The output from performing the IDWT operation.
 pub(crate) struct IDWTOutput {
-    /// The raw, transformed coefficients.
+    /// The buffer that will hold the final coefficients.
     pub(crate) coefficients: Vec<f32>,
-    /// The rect that the samples belong to. This will be equivalent
+    /// The size of the padding applied to each side.
+    pub(crate) padding: Padding,
+    /// The rect that the coefficients belong to. This will be equivalent
     /// to the rectangle that forms the smallest decomposition level. It does
     /// not have to be equivalent to the original size of the tile, as the
     /// sub-bands that form a tile aren't necessarily aligned to it. Therefore,
@@ -21,66 +40,165 @@ pub(crate) struct IDWTOutput {
     pub(crate) rect: IntRect,
 }
 
+impl IDWTOutput {
+    pub(crate) fn dummy() -> Self {
+        Self {
+            coefficients: vec![],
+            padding: Default::default(),
+            rect: IntRect::from_ltrb(0, 0, u32::MAX, u32::MAX),
+        }
+    }
+}
+
+impl IDWTOutput {
+    /// The total width of the output, including padding.
+    pub(crate) fn total_width(&self) -> u32 {
+        self.padding.left as u32 + self.rect.width() + self.padding.right as u32
+    }
+}
+
+struct IDWTTempOutput {
+    padding: Padding,
+    rect: IntRect,
+}
+
 /// Apply the inverse discrete wavelet transform (see Annex F). The output
 /// will be transformed samples covering the rectangle of the smallest
 /// decomposition level.
 pub(crate) fn apply(
-    // The LL sub-band for resolution level 0.
-    ll_sub_band: &SubBand,
-    // All decomposition level that make up the tile.
-    decompositions: &[Decomposition],
-    sub_bands: &[SubBand],
+    storage: &DecompositionStorage,
+    tile_ctx: &mut TileDecodeContext,
+    component_idx: usize,
     transform: WaveletTransform,
-) -> IDWTOutput {
+) {
+    let tile_decompositions = &storage.tile_decompositions[component_idx];
+
+    let decompositions = &storage.decompositions[tile_decompositions.decompositions.clone()];
+    let ll_sub_band = &storage.sub_bands[tile_decompositions.first_ll_sub_band];
+
+    // To explain a bit why we have this scratch buffer and another coefficient
+    // buffer: During IDWT, we need to continuously interleave the 4 sub-bands
+    // into a new buffer, which is then either returned or used as the input
+    // for the next decomposition, etc. It would be very inefficient if we
+    // kept allocating new buffers each time. Therefore, we try to reuse them,
+    // not only for all decompositions of a single tile, but all decompositions
+    // of _all_ tiles.
+    // Due to the fact that the output from the previous iteration might be
+    // used as the input of the next, we need two separate buffers, which
+    // are continuously swapped.
+    let (scratch_buf, output) = (&mut tile_ctx.idwt_scratch_buffer, &mut tile_ctx.idwt_output);
+
+    let estimate_buffer_size = |decomposition: &Decomposition| {
+        // The maximum padding size (determined by
+        // `left_extension`/`right_extension`) is 4 + 1 = 5.
+        const MAX_PADDING: usize = 5;
+        // For the width, we also need to account for additional padding on the
+        // right side added for SIMD (see `interleave_samples`).
+        let total_width =
+            MAX_PADDING + decomposition.rect.width() as usize + MAX_PADDING + SIMD_WIDTH;
+        let total_height = MAX_PADDING + decomposition.rect.height() as usize + MAX_PADDING;
+
+        let min = total_width * total_height;
+        // Different sub-bands can have shifts by one, so add even more padding
+        // for the maximum case.
+        let max = (total_width + 1) * (total_height + 1);
+
+        (min, max)
+    };
+
     if decompositions.is_empty() {
-        return IDWTOutput {
-            coefficients: ll_sub_band.clone().coefficients,
-            rect: ll_sub_band.rect,
-        };
+        // Single decomposition, just copy the coefficients from the sub-band.
+        output.coefficients.clear();
+        output
+            .coefficients
+            .extend_from_slice(&storage.coefficients[ll_sub_band.coefficients.clone()]);
+
+        output.padding = Padding::default();
+        output.rect = ll_sub_band.rect;
+
+        return;
     }
 
-    let mut temp_buf = vec![];
+    // The coefficient array will always be the one that holds the coefficients
+    // from the highest decomposition. Therefore, reserve as much.
+    let (s_min, s_max) = estimate_buffer_size(decompositions.last().unwrap());
+    if output.coefficients.capacity() < s_min {
+        output
+            .coefficients
+            .reserve_exact(s_max - output.coefficients.capacity());
+    }
 
-    let mut output = filter_2d(
-        IDWTInput::from_sub_band(ll_sub_band),
+    if decompositions.len() > 1 {
+        // Due to the above, the intermediate buffer will never need more than
+        // the second-highest decomposition.
+        let (s_min, s_max) = estimate_buffer_size(&decompositions[decompositions.len() - 2]);
+
+        if scratch_buf.capacity() < s_min {
+            scratch_buf.reserve_exact(s_max - scratch_buf.capacity());
+        }
+    }
+
+    // Determine which buffer we should use first, such that the `coefficients`
+    // array will always hold the final values.
+    let mut use_scratch = decompositions.len().is_multiple_of(2);
+
+    let mut temp_output = filter_2d(
+        IDWTInput::from_sub_band(ll_sub_band, storage),
+        if use_scratch {
+            scratch_buf
+        } else {
+            &mut output.coefficients
+        },
         &decompositions[0],
         transform,
-        &mut temp_buf,
-        sub_bands,
+        storage,
     );
 
     for decomposition in decompositions.iter().skip(1) {
-        output = filter_2d(
-            IDWTInput::from_output(&output),
-            decomposition,
-            transform,
-            &mut temp_buf,
-            sub_bands,
-        );
+        use_scratch = !use_scratch;
+
+        temp_output = if use_scratch {
+            filter_2d(
+                IDWTInput::from_output(&temp_output, &output.coefficients),
+                scratch_buf,
+                decomposition,
+                transform,
+                storage,
+            )
+        } else {
+            filter_2d(
+                IDWTInput::from_output(&temp_output, scratch_buf),
+                &mut output.coefficients,
+                decomposition,
+                transform,
+                storage,
+            )
+        };
     }
 
-    output
+    output.rect = temp_output.rect;
+    output.padding = temp_output.padding;
 }
 
 struct IDWTInput<'a> {
     coefficients: &'a [f32],
-    rect: IntRect,
+    padding: Padding,
     sub_band_type: SubBandType,
 }
 
 impl<'a> IDWTInput<'a> {
-    fn from_sub_band(sub_band: &'a SubBand) -> IDWTInput<'a> {
+    fn from_sub_band(sub_band: &'a SubBand, storage: &'a DecompositionStorage) -> IDWTInput<'a> {
         IDWTInput {
-            coefficients: &sub_band.coefficients,
-            rect: sub_band.rect,
+            coefficients: &storage.coefficients[sub_band.coefficients.clone()],
+            padding: Padding::default(),
             sub_band_type: sub_band.sub_band_type,
         }
     }
 
-    fn from_output(idwt_output: &'a IDWTOutput) -> IDWTInput<'a> {
+    fn from_output(idwt_output: &'a IDWTTempOutput, coefficients: &'a [f32]) -> IDWTInput<'a> {
         IDWTInput {
-            coefficients: &idwt_output.coefficients,
-            rect: idwt_output.rect,
+            coefficients,
+            padding: idwt_output.padding,
             // The output from a previous iteration turns into the LL sub band
             // for the next iteration.
             sub_band_type: SubBandType::LowLow,
@@ -88,23 +206,27 @@ impl<'a> IDWTInput<'a> {
     }
 }
 
-/// The 2D_INTERLEAVE procedure described in F.3.3.
+/// The 2D_SR procedure illustrated in Figure F.6.
 fn filter_2d(
-    // The LL sub band.
+    // The LL sub band of the given decomposition level.
     input: IDWTInput,
+    coefficients: &mut Vec<f32>,
     decomposition: &Decomposition,
     transform: WaveletTransform,
-    temp_buf: &mut Vec<f32>,
-    sub_bands: &[SubBand],
-) -> IDWTOutput {
-    let mut coefficients = interleave_samples(input, decomposition, sub_bands);
+    storage: &DecompositionStorage,
+) -> IDWTTempOutput {
+    // First interleave all sub-bands into a single buffer. We also
+    // apply a padding so that we can transparently deal with border values.
+    let padding = interleave_samples(input, decomposition, coefficients, transform, storage);
 
-    filter_horizontal(&mut coefficients, temp_buf, decomposition.rect, &transform);
-    filter_vertical(&mut coefficients, temp_buf, decomposition.rect, &transform);
+    if decomposition.rect.width() > 0 && decomposition.rect.height() > 0 {
+        filter_horizontal(coefficients, padding, decomposition.rect, transform);
+        simd::filter_vertical(coefficients, padding, decomposition.rect, transform);
+    }
 
-    IDWTOutput {
-        coefficients,
+    IDWTTempOutput {
         rect: decomposition.rect,
+        padding,
     }
 }
 
@@ -112,10 +234,62 @@ fn filter_2d(
 fn interleave_samples(
     input: IDWTInput,
     decomposition: &Decomposition,
-    sub_bands: &[SubBand],
-) -> Vec<f32> {
-    let mut coefficients =
-        vec![0.0; (decomposition.rect.width() * decomposition.rect.height()) as usize];
+    coefficients: &mut Vec<f32>,
+    transform: WaveletTransform,
+    storage: &DecompositionStorage,
+) -> Padding {
+    let new_padding = {
+        // The reason why we need + 1 for the left and top padding is very
+        // subtle. In general, the methods return how many indices to the
+        // left of the border can possibly be accessed. This is dependent
+        // on the wavelet transform but also whether the start index (indicated
+        // by the rect of the decomposition) is even or odd.
+        //
+        // For example, let's say we are using the 5-3 transform and our index
+        // is even. According to the table, we need a padding of one to the left.
+        // This makes sense, because our `base_idx` in 5-3 is (start / 2) * 2.
+        // And the lowest access is `base_idx - 1`. So, for example, if start is
+        // 2, then:
+        // base_idx = (2 / 2) * 2 = 2,
+        // and our lowest access is 1, so a padding of 1 is sufficient.
+        // However, if we were to add only a padding of 1, our previously even
+        // index now becomes uneven (3), and the previous math doesn't work
+        // anymore since the evenness changed. Now, if we rerun the calculation:
+        // base_idx = (3 / 2) * 2 = 2,
+        // and our lowest access is therefore 1 again, which represents a delta
+        // of 2 instead of the previously calculated 1.
+        // Therefore, we always need to add a padding of 1 to the top and
+        // left to prevent OOB accesses.
+        let left_padding = left_extension(transform, decomposition.rect.x0 as usize) + 1;
+        let top_padding = left_extension(transform, decomposition.rect.y0 as usize) + 1;
+        let mut right_padding = right_extension(transform, decomposition.rect.x1 as usize);
+        let bottom_padding = right_extension(transform, decomposition.rect.y1 as usize);
+
+        // For vertical filtering, we use SIMD to process multiple columns at
+        // the same time. Therefore, we add additional padding to the
+        // right such that we can always iterate in chunks of our SIMD width
+        // without having to deal with any remainder.
+        let current_width = left_padding + decomposition.rect.width() as usize + right_padding;
+        let target_width = current_width.next_multiple_of(SIMD_WIDTH);
+        right_padding += target_width - current_width;
+
+        Padding::new(left_padding, top_padding, right_padding, bottom_padding)
+    };
+
+    let total_width = decomposition.rect.width() as usize + new_padding.left + new_padding.right;
+    let total_height = decomposition.rect.height() as usize + new_padding.top + new_padding.bottom;
+
+    // Just a sanity check. We should have allocated enough upfront before
+    // starting the IDWT.
+    assert!(coefficients.capacity() >= total_width * total_height);
+
+    // The cleaner way would be to first clear and then resize, so that we
+    // have a clean buffer with just zeroes. However, this is actually not
+    // necessary, because when interleaving and generating the border values
+    // we will replace all the data anyway, so we can save the cost of
+    // the clear operation.
+    coefficients.resize(total_width * total_height, 0.0);
+
     let IntRect {
         x0: u0,
         x1: u1,
@@ -123,117 +297,91 @@ fn interleave_samples(
         y1: v1,
     } = decomposition.rect;
 
-    for sub_band in [
+    // Perform the actual interleaving of sub-bands, taking the padding into
+    // account.
+    for idwt_input in [
         input,
-        IDWTInput::from_sub_band(&sub_bands[decomposition.sub_bands[0]]),
-        IDWTInput::from_sub_band(&sub_bands[decomposition.sub_bands[1]]),
-        IDWTInput::from_sub_band(&sub_bands[decomposition.sub_bands[2]]),
+        IDWTInput::from_sub_band(&storage.sub_bands[decomposition.sub_bands[0]], storage),
+        IDWTInput::from_sub_band(&storage.sub_bands[decomposition.sub_bands[1]], storage),
+        IDWTInput::from_sub_band(&storage.sub_bands[decomposition.sub_bands[2]], storage),
     ] {
-        let (u_min, u_max) = match sub_band.sub_band_type {
+        let (u_min, u_max) = match idwt_input.sub_band_type {
             SubBandType::LowLow | SubBandType::LowHigh => (u0.div_ceil(2), u1.div_ceil(2)),
             SubBandType::HighLow | SubBandType::HighHigh => (u0 / 2, u1 / 2),
         };
 
-        let (v_min, v_max) = match sub_band.sub_band_type {
+        let (v_min, v_max) = match idwt_input.sub_band_type {
             SubBandType::LowLow | SubBandType::HighLow => (v0.div_ceil(2), v1.div_ceil(2)),
             SubBandType::LowHigh | SubBandType::HighHigh => (v0 / 2, v1 / 2),
         };
 
-        for v_b in v_min..v_max {
-            for u_b in u_min..u_max {
-                let (x, y) = match sub_band.sub_band_type {
-                    SubBandType::LowLow => (2 * u_b, 2 * v_b),
-                    SubBandType::LowHigh => (2 * u_b, 2 * v_b + 1),
-                    SubBandType::HighLow => (2 * u_b + 1, 2 * v_b),
-                    SubBandType::HighHigh => (2 * u_b + 1, 2 * v_b + 1),
-                };
+        let num_v = v_max - v_min;
+        let num_u = u_max - u_min;
 
-                coefficients[((y - v0) * decomposition.rect.width() + (x - u0)) as usize] =
-                    sub_band.coefficients
-                        [((v_b - v_min) * sub_band.rect.width() + (u_b - u_min)) as usize];
+        let input_left_padding = idwt_input.padding.left;
+        let input_right_padding = idwt_input.padding.right;
+        let input_total_width = num_u + input_left_padding as u32 + input_right_padding as u32;
+
+        if num_u == 0 || num_v == 0 {
+            continue;
+        }
+
+        let (start_x, start_y) = match idwt_input.sub_band_type {
+            SubBandType::LowLow => (2 * u_min, 2 * v_min),
+            SubBandType::LowHigh => (2 * u_min, 2 * v_min + 1),
+            SubBandType::HighLow => (2 * u_min + 1, 2 * v_min),
+            SubBandType::HighHigh => (2 * u_min + 1, 2 * v_min + 1),
+        };
+
+        let coefficient_rows = coefficients
+            .chunks_exact_mut(total_width)
+            .map(|s| &mut s[new_padding.left..][..decomposition.rect.width() as usize])
+            .skip((start_y - v0) as usize + new_padding.top)
+            .step_by(2);
+
+        for (v_b, coefficient_row) in coefficient_rows.enumerate().take(num_v as usize) {
+            // Hint compiler to drop bounds checks.
+            let coefficient_row =
+                &mut coefficient_row[(start_x - u0) as usize..][..(num_u - 1) as usize * 2 + 1];
+
+            for u_b in 0..num_u {
+                coefficient_row[u_b as usize * 2] = idwt_input.coefficients[(v_b
+                    + idwt_input.padding.top)
+                    * input_total_width as usize
+                    + u_b as usize
+                    + input_left_padding];
             }
         }
     }
 
-    coefficients
+    new_padding
 }
 
 /// The HOR_SR procedure from F.3.4.
 fn filter_horizontal(
-    scanline: &mut [f32],
-    temp_buf: &mut Vec<f32>,
+    coefficients: &mut [f32],
+    padding: Padding,
     rect: IntRect,
-    transform: &WaveletTransform,
+    transform: WaveletTransform,
 ) {
-    // There's some subtlety going on here. The extension procedure defined in
-    // the spec is based on the start and end values i0 and i1 which are
-    // dependent on the rectangle of the sub-band we are currently processing.
-    // The problem is that if we use the values as is, if we for example had the
-    // i0/i1 values larger than 1000, we would have to allocate a buffer of
-    // length at least 1000, even though the width/height of the rectangle is
-    // much less. Looking at the equations more closely, it becomes apparent
-    // that the real value of i0/i1 is not relevant, and the behavior of
-    // subsequent operations only really depends on whether val % 2 == 0 or
-    // not. Therefore, we shift the values of i0 and i1 such that the property
-    // still remains the same, but the values themselves are much smaller.
+    let total_width = rect.width() as usize + padding.left + padding.right;
 
-    let shift = PADDING_SHIFT + if !rect.x0.is_multiple_of(2) { 1 } else { 0 };
-
-    for v in 0..rect.height() {
-        temp_buf.clear();
-        // Add left padding for 1D_EXTR procedure.
-        temp_buf.extend(iter::repeat_n(0.0, shift));
-
-        let start_idx = rect.width() as usize * v as usize;
-
-        // Extract row into buffer.
-        temp_buf.extend_from_slice(&scanline[start_idx..][..rect.width() as usize]);
-
-        // Add right padding for 1D_EXTR procedure.
-        temp_buf.extend(iter::repeat_n(0.0, shift));
-
-        filter_single_row(temp_buf, shift, shift + rect.width() as usize, transform);
-
-        // Put values back into original array.
-        scanline[start_idx..][..rect.width() as usize]
-            .copy_from_slice(&temp_buf[shift..][..rect.width() as usize]);
-    }
-}
-
-/// The VER_SR procedure from F.3.5.
-fn filter_vertical(
-    a: &mut [f32],
-    temp_buf: &mut Vec<f32>,
-    rect: IntRect,
-    transform: &WaveletTransform,
-) {
-    // See the comment in `filter_horizontal`.
-    let shift = PADDING_SHIFT + if !rect.y0.is_multiple_of(2) { 1 } else { 0 };
-
-    for u in 0..rect.width() {
-        temp_buf.clear();
-        // Add left padding for 1D_EXTR procedure.
-        temp_buf.extend(iter::repeat_n(0.0, shift));
-
-        // Extract column into buffer.
-        for y in 0..rect.height() {
-            temp_buf.push(a[(u + rect.width() * y) as usize]);
-        }
-
-        // Add right padding for 1D_EXTR procedure.
-        temp_buf.extend(iter::repeat_n(0.0, shift));
-
-        filter_single_row(temp_buf, shift, shift + rect.height() as usize, transform);
-
-        // Put values back into original array.
-        for (idx, y) in (0..rect.height()).enumerate() {
-            a[(u + rect.width() * y) as usize] = temp_buf[shift + idx]
-        }
+    for scanline in coefficients
+        .chunks_exact_mut(total_width)
+        .skip(padding.top)
+        .take(rect.height() as usize)
+    {
+        filter_single_row(
+            scanline,
+            padding.left,
+            padding.left + rect.width() as usize,
+            transform,
+        );
     }
 }
 
 /// The 1D_SR procedure from F.3.6.
-fn filter_single_row(scanline: &mut [f32], start: usize, end: usize, transform: &WaveletTransform) {
+fn filter_single_row(scanline: &mut [f32], start: usize, end: usize, transform: WaveletTransform) {
     if start == end - 1 {
         if !start.is_multiple_of(2) {
             scanline[start] /= 2.0;
@@ -313,40 +461,9 @@ fn irreversible_filter_97i(scanline: &mut [f32], start: usize, end: usize) {
 }
 
 /// The 1D_EXTR procedure, defined in F.3.7.
-fn extend_signal(scanline: &mut [f32], start: usize, end: usize, transform: &WaveletTransform) {
-    let i_left = match transform {
-        WaveletTransform::Reversible53 => {
-            if start.is_multiple_of(2) {
-                1
-            } else {
-                2
-            }
-        }
-        WaveletTransform::Irreversible97 => {
-            if start.is_multiple_of(2) {
-                3
-            } else {
-                4
-            }
-        }
-    };
-
-    let i_right = match transform {
-        WaveletTransform::Reversible53 => {
-            if end.is_multiple_of(2) {
-                2
-            } else {
-                1
-            }
-        }
-        WaveletTransform::Irreversible97 => {
-            if end.is_multiple_of(2) {
-                4
-            } else {
-                3
-            }
-        }
-    };
+fn extend_signal(scanline: &mut [f32], start: usize, end: usize, transform: WaveletTransform) {
+    let i_left = left_extension(transform, start);
+    let i_right = right_extension(transform, end);
 
     for i in (start - i_left)..start {
         scanline[i] = scanline[periodic_symmetric_extension(i, start, end)];
@@ -357,11 +474,490 @@ fn extend_signal(scanline: &mut [f32], start: usize, end: usize, transform: &Wav
     }
 }
 
+fn left_extension(transform: WaveletTransform, start: usize) -> usize {
+    // Table F.2.
+    match transform {
+        WaveletTransform::Reversible53 => {
+            if start.is_multiple_of(2) {
+                1
+            } else {
+                2
+            }
+        }
+        WaveletTransform::Irreversible97 => {
+            if start.is_multiple_of(2) {
+                3
+            } else {
+                4
+            }
+        }
+    }
+}
+
+fn right_extension(transform: WaveletTransform, end: usize) -> usize {
+    // Table F.3.
+    match transform {
+        WaveletTransform::Reversible53 => {
+            if end.is_multiple_of(2) {
+                2
+            } else {
+                1
+            }
+        }
+        WaveletTransform::Irreversible97 => {
+            if end.is_multiple_of(2) {
+                4
+            } else {
+                3
+            }
+        }
+    }
+}
+
 /// Perform the periodic symmetric extension, specified in Equation (F-4).
 fn periodic_symmetric_extension(idx: usize, start: usize, end: usize) -> usize {
     let span = 2 * (end as i32 - start as i32 - 1);
     let offset = (idx as i32 - start as i32).rem_euclid(span);
     (start as i32 + offset.min(span - offset)) as usize
+}
+
+#[cfg(feature = "simd")]
+mod simd {
+    use crate::codestream::WaveletTransform;
+    use crate::idwt::{Padding, left_extension, periodic_symmetric_extension, right_extension};
+    use crate::rect::IntRect;
+    use fearless_simd::*;
+
+    const SIMD_WIDTH: usize = super::SIMD_WIDTH;
+    type F32<S> = f32x8<S>;
+
+    /// The VER_SR procedure from F.3.5.
+    pub(super) fn filter_vertical(
+        coefficients: &mut [f32],
+        padding: Padding,
+        rect: IntRect,
+        transform: WaveletTransform,
+    ) {
+        let level = Level::new();
+        dispatch!(level, simd => filter_vertical_impl(simd, coefficients, padding, rect, transform));
+    }
+
+    #[inline(always)]
+    fn filter_vertical_impl<S: Simd>(
+        simd: S,
+        coefficients: &mut [f32],
+        padding: Padding,
+        rect: IntRect,
+        transform: WaveletTransform,
+    ) {
+        let total_width = rect.width() as usize + padding.left + padding.right;
+        filter_rows(
+            simd,
+            coefficients,
+            padding.top,
+            padding.top + rect.height() as usize,
+            total_width,
+            transform,
+        );
+    }
+
+    /// The 1D_SR procedure from F.3.6, but using SIMD.
+    #[inline(always)]
+    fn filter_rows<S: Simd>(
+        simd: S,
+        scanline: &mut [f32],
+        start: usize,
+        end: usize,
+        stride: usize,
+        transform: WaveletTransform,
+    ) {
+        if start == end - 1 {
+            if !start.is_multiple_of(2) {
+                for base_column in (0..stride).step_by(SIMD_WIDTH) {
+                    let mut loaded = F32::from_slice(
+                        simd,
+                        &scanline[(start * stride) + base_column..][..SIMD_WIDTH],
+                    );
+                    loaded /= 2.0;
+                    scanline[(start * stride) + base_column..][..SIMD_WIDTH]
+                        .copy_from_slice(&loaded.val);
+                }
+            }
+
+            return;
+        }
+
+        extend_signal(simd, scanline, start, end, stride, transform);
+
+        match transform {
+            WaveletTransform::Reversible53 => {
+                reversible_filter_53r(simd, scanline, start, end, stride);
+            }
+            WaveletTransform::Irreversible97 => {
+                irreversible_filter_97i(simd, scanline, start, end, stride);
+            }
+        }
+    }
+
+    /// The 1D_EXTR procedure, defined in F.3.7.
+    #[inline(always)]
+    fn extend_signal<S: Simd>(
+        simd: S,
+        scanline: &mut [f32],
+        start: usize,
+        end: usize,
+        stride: usize,
+        transform: WaveletTransform,
+    ) {
+        let i_left = left_extension(transform, start);
+        let i_right = right_extension(transform, end);
+
+        for i in (start - i_left)..start {
+            for base_column in (0..stride).step_by(SIMD_WIDTH) {
+                let idx = periodic_symmetric_extension(i, start, end);
+                let loaded =
+                    F32::from_slice(simd, &scanline[idx * stride + base_column..][..SIMD_WIDTH]);
+                scanline[i * stride + base_column..][..SIMD_WIDTH].copy_from_slice(&loaded.val);
+            }
+        }
+
+        for i in end..(end + i_right) {
+            for base_column in (0..stride).step_by(SIMD_WIDTH) {
+                let idx = periodic_symmetric_extension(i, start, end);
+                let loaded =
+                    F32::from_slice(simd, &scanline[idx * stride + base_column..][..SIMD_WIDTH]);
+                scanline[i * stride + base_column..][..SIMD_WIDTH].copy_from_slice(&loaded.val);
+            }
+        }
+    }
+
+    /// The 1D FILTER 5-3R procedure from F.3.8.1.
+    #[inline(always)]
+    fn reversible_filter_53r<S: Simd>(
+        simd: S,
+        scanline: &mut [f32],
+        start: usize,
+        end: usize,
+        stride: usize,
+    ) {
+        // Equation (F-5).
+        for n in start / 2..(end / 2) + 1 {
+            for base_column in (0..stride).step_by(SIMD_WIDTH) {
+                let base_idx = 2 * n * stride + base_column;
+
+                let mut s1 = F32::from_slice(simd, &scanline[base_idx..][..SIMD_WIDTH]);
+                let s2 = F32::from_slice(simd, &scanline[base_idx - stride..][..SIMD_WIDTH]);
+                let s3 = F32::from_slice(simd, &scanline[base_idx + stride..][..SIMD_WIDTH]);
+
+                s1 -= ((s2 + s3 + 2.0) / 4.0).floor();
+
+                scanline[base_idx..][..SIMD_WIDTH].copy_from_slice(&s1.val);
+            }
+        }
+
+        // Equation (F-6).
+        for n in start / 2..(end / 2) {
+            for base_column in (0..stride).step_by(SIMD_WIDTH) {
+                let base_idx = (2 * n + 1) * stride + base_column;
+
+                let mut s1 = F32::from_slice(simd, &scanline[base_idx..][..SIMD_WIDTH]);
+                let s2 = F32::from_slice(simd, &scanline[base_idx - stride..][..SIMD_WIDTH]);
+                let s3 = F32::from_slice(simd, &scanline[base_idx + stride..][..SIMD_WIDTH]);
+
+                s1 += ((s2 + s3) / 2.0).floor();
+
+                scanline[base_idx..][..SIMD_WIDTH].copy_from_slice(&s1.val);
+            }
+        }
+    }
+
+    /// The 1D Filter 9-7I procedure from F.3.8.2.
+    #[inline(always)]
+    fn irreversible_filter_97i<S: Simd>(
+        simd: S,
+        scanline: &mut [f32],
+        start: usize,
+        end: usize,
+        stride: usize,
+    ) {
+        const ALPHA: f32 = -1.586_134_3;
+        const BETA: f32 = -0.052_980_117;
+        const GAMMA: f32 = 0.882_911_1;
+        const DELTA: f32 = 0.443_506_87;
+        const KAPPA: f32 = 1.230_174_1;
+
+        let alpha = F32::splat(simd, ALPHA);
+        let beta = F32::splat(simd, BETA);
+        let gamma = F32::splat(simd, GAMMA);
+        let delta = F32::splat(simd, DELTA);
+        let kappa = F32::splat(simd, KAPPA);
+        let inv_kappa = F32::splat(simd, 1.0 / KAPPA);
+
+        // Step 1.
+        for i in (start / 2 - 1)..(end / 2 + 2) {
+            for base_column in (0..stride).step_by(SIMD_WIDTH) {
+                let base_idx = (2 * i) * stride + base_column;
+                let mut vals = F32::from_slice(simd, &scanline[base_idx..][..SIMD_WIDTH]);
+                vals *= kappa;
+                scanline[base_idx..][..SIMD_WIDTH].copy_from_slice(&vals.val);
+            }
+        }
+
+        // Step 2.
+        for i in (start / 2 - 2)..(end / 2 + 2) {
+            for base_column in (0..stride).step_by(SIMD_WIDTH) {
+                let base_idx = (2 * i + 1) * stride + base_column;
+                let mut vals = F32::from_slice(simd, &scanline[base_idx..][..SIMD_WIDTH]);
+                vals *= inv_kappa;
+                scanline[base_idx..][..SIMD_WIDTH].copy_from_slice(&vals.val);
+            }
+        }
+
+        // Step 3.
+        for i in (start / 2 - 1)..(end / 2 + 2) {
+            for base_column in (0..stride).step_by(SIMD_WIDTH) {
+                let base_idx = (2 * i) * stride + base_column;
+
+                let mut s1 = F32::from_slice(simd, &scanline[base_idx..][..SIMD_WIDTH]);
+                let s2 = F32::from_slice(simd, &scanline[base_idx - stride..][..SIMD_WIDTH]);
+                let s3 = F32::from_slice(simd, &scanline[base_idx + stride..][..SIMD_WIDTH]);
+
+                s1 -= delta * (s2 + s3);
+                scanline[base_idx..][..SIMD_WIDTH].copy_from_slice(&s1.val);
+            }
+        }
+
+        // Step 4.
+        for i in (start / 2 - 1)..(end / 2 + 1) {
+            for base_column in (0..stride).step_by(SIMD_WIDTH) {
+                let base_idx = (2 * i + 1) * stride + base_column;
+
+                let mut s1 = F32::from_slice(simd, &scanline[base_idx..][..SIMD_WIDTH]);
+                let s2 = F32::from_slice(simd, &scanline[base_idx - stride..][..SIMD_WIDTH]);
+                let s3 = F32::from_slice(simd, &scanline[base_idx + stride..][..SIMD_WIDTH]);
+
+                s1 -= gamma * (s2 + s3);
+                scanline[base_idx..][..SIMD_WIDTH].copy_from_slice(&s1.val);
+            }
+        }
+
+        // Step 5.
+        for i in (start / 2)..(end / 2 + 1) {
+            for base_column in (0..stride).step_by(SIMD_WIDTH) {
+                let base_idx = (2 * i) * stride + base_column;
+
+                let mut s1 = F32::from_slice(simd, &scanline[base_idx..][..SIMD_WIDTH]);
+                let s2 = F32::from_slice(simd, &scanline[base_idx - stride..][..SIMD_WIDTH]);
+                let s3 = F32::from_slice(simd, &scanline[base_idx + stride..][..SIMD_WIDTH]);
+
+                s1 -= beta * (s2 + s3);
+                scanline[base_idx..][..SIMD_WIDTH].copy_from_slice(&s1.val);
+            }
+        }
+
+        // Step 6.
+        for i in (start / 2)..(end / 2) {
+            for base_column in (0..stride).step_by(SIMD_WIDTH) {
+                let base_idx = (2 * i + 1) * stride + base_column;
+
+                let mut s1 = F32::from_slice(simd, &scanline[base_idx..][..SIMD_WIDTH]);
+                let s2 = F32::from_slice(simd, &scanline[base_idx - stride..][..SIMD_WIDTH]);
+                let s3 = F32::from_slice(simd, &scanline[base_idx + stride..][..SIMD_WIDTH]);
+
+                s1 -= alpha * (s2 + s3);
+                scanline[base_idx..][..SIMD_WIDTH].copy_from_slice(&s1.val);
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "simd"))]
+mod simd {
+    use crate::codestream::WaveletTransform;
+    use crate::idwt::{Padding, left_extension, periodic_symmetric_extension, right_extension};
+    use crate::rect::IntRect;
+
+    const SIMD_WIDTH: usize = super::SIMD_WIDTH;
+
+    pub(super) fn filter_vertical(
+        coefficients: &mut [f32],
+        padding: Padding,
+        rect: IntRect,
+        transform: WaveletTransform,
+    ) {
+        filter_vertical_impl(coefficients, padding, rect, transform);
+    }
+
+    fn filter_vertical_impl(
+        coefficients: &mut [f32],
+        padding: Padding,
+        rect: IntRect,
+        transform: WaveletTransform,
+    ) {
+        let total_width = rect.width() as usize + padding.left + padding.right;
+        filter_rows(
+            coefficients,
+            padding.top,
+            padding.top + rect.height() as usize,
+            total_width,
+            transform,
+        );
+    }
+
+    fn filter_rows(
+        scanline: &mut [f32],
+        start: usize,
+        end: usize,
+        stride: usize,
+        transform: WaveletTransform,
+    ) {
+        if start == end - 1 {
+            if !start.is_multiple_of(2) {
+                let row_offset = start * stride;
+                for_each_lane(row_offset, stride, |idx| {
+                    scanline[idx] /= 2.0;
+                });
+            }
+
+            return;
+        }
+
+        extend_signal(scanline, start, end, stride, transform);
+
+        match transform {
+            WaveletTransform::Reversible53 => {
+                reversible_filter_53r(scanline, start, end, stride);
+            }
+            WaveletTransform::Irreversible97 => {
+                irreversible_filter_97i(scanline, start, end, stride);
+            }
+        }
+    }
+
+    fn extend_signal(
+        scanline: &mut [f32],
+        start: usize,
+        end: usize,
+        stride: usize,
+        transform: WaveletTransform,
+    ) {
+        let i_left = left_extension(transform, start);
+        let i_right = right_extension(transform, end);
+
+        for i in (start - i_left)..start {
+            let src = periodic_symmetric_extension(i, start, end);
+            copy_row(scanline, src, i, stride);
+        }
+
+        for i in end..(end + i_right) {
+            let src = periodic_symmetric_extension(i, start, end);
+            copy_row(scanline, src, i, stride);
+        }
+    }
+
+    fn copy_row(scanline: &mut [f32], src_row: usize, dst_row: usize, stride: usize) {
+        if src_row == dst_row {
+            return;
+        }
+
+        let src_offset = src_row * stride;
+        let dst_offset = dst_row * stride;
+
+        for_each_lane(dst_offset, stride, |dst_idx| {
+            let src_idx = src_offset + (dst_idx - dst_offset);
+            scanline[dst_idx] = scanline[src_idx];
+        });
+    }
+
+    fn reversible_filter_53r(scanline: &mut [f32], start: usize, end: usize, stride: usize) {
+        for n in start / 2..(end / 2) + 1 {
+            let row_offset = 2 * n * stride;
+            for_each_lane(row_offset, stride, |idx| {
+                let s1 = scanline[idx];
+                let s2 = scanline[idx - stride];
+                let s3 = scanline[idx + stride];
+                scanline[idx] = s1 - ((s2 + s3 + 2.0) / 4.0).floor();
+            });
+        }
+
+        for n in start / 2..(end / 2) {
+            let row_offset = (2 * n + 1) * stride;
+            for_each_lane(row_offset, stride, |idx| {
+                let s1 = scanline[idx];
+                let s2 = scanline[idx - stride];
+                let s3 = scanline[idx + stride];
+                scanline[idx] = s1 + ((s2 + s3) / 2.0).floor();
+            });
+        }
+    }
+
+    fn irreversible_filter_97i(scanline: &mut [f32], start: usize, end: usize, stride: usize) {
+        const ALPHA: f32 = -1.586_134_3;
+        const BETA: f32 = -0.052_980_117;
+        const GAMMA: f32 = 0.882_911_1;
+        const DELTA: f32 = 0.443_506_87;
+        const KAPPA: f32 = 1.230_174_1;
+        const INV_KAPPA: f32 = 1.0 / KAPPA;
+
+        for i in (start / 2 - 1)..(end / 2 + 2) {
+            let row_offset = (2 * i) * stride;
+            for_each_lane(row_offset, stride, |idx| {
+                scanline[idx] *= KAPPA;
+            });
+        }
+
+        for i in (start / 2 - 2)..(end / 2 + 2) {
+            let row_offset = (2 * i + 1) * stride;
+            for_each_lane(row_offset, stride, |idx| {
+                scanline[idx] *= INV_KAPPA;
+            });
+        }
+
+        for i in (start / 2 - 1)..(end / 2 + 2) {
+            let row_offset = (2 * i) * stride;
+            for_each_lane(row_offset, stride, |idx| {
+                let s2 = scanline[idx - stride];
+                let s3 = scanline[idx + stride];
+                scanline[idx] -= DELTA * (s2 + s3);
+            });
+        }
+
+        for i in (start / 2 - 1)..(end / 2 + 1) {
+            let row_offset = (2 * i + 1) * stride;
+            for_each_lane(row_offset, stride, |idx| {
+                let s2 = scanline[idx - stride];
+                let s3 = scanline[idx + stride];
+                scanline[idx] -= GAMMA * (s2 + s3);
+            });
+        }
+
+        for i in (start / 2)..(end / 2 + 1) {
+            let row_offset = (2 * i) * stride;
+            for_each_lane(row_offset, stride, |idx| {
+                let s2 = scanline[idx - stride];
+                let s3 = scanline[idx + stride];
+                scanline[idx] -= BETA * (s2 + s3);
+            });
+        }
+
+        for i in (start / 2)..(end / 2) {
+            let row_offset = (2 * i + 1) * stride;
+            for_each_lane(row_offset, stride, |idx| {
+                let s2 = scanline[idx - stride];
+                let s3 = scanline[idx + stride];
+                scanline[idx] -= ALPHA * (s2 + s3);
+            });
+        }
+    }
+
+    #[inline(always)]
+    fn for_each_lane(row_offset: usize, stride: usize, mut func: impl FnMut(usize)) {
+        for base_column in (0..stride).step_by(SIMD_WIDTH) {
+            for lane in 0..SIMD_WIDTH {
+                func(row_offset + base_column + lane);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -385,7 +981,7 @@ mod tests {
     #[test]
     fn extend_1d() {
         let mut data = [0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0];
-        super::extend_signal(&mut data, 3, 9, &WaveletTransform::Reversible53);
+        super::extend_signal(&mut data, 3, 9, WaveletTransform::Reversible53);
 
         assert_eq!(
             data,
